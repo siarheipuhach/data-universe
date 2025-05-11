@@ -51,6 +51,7 @@ from scraping.scraper import ScrapeConfig, ScraperId
 
 from scraping.x.enhanced_apidojo_scraper import EnhancedApiDojoTwitterScraper
 import json
+from statsd import StatsClient
 
 # Enable logging to the miner TODO move it to some different location
 bt.logging.set_info(True)
@@ -60,6 +61,7 @@ class Miner:
     """The Glorious Miner."""
 
     def __init__(self, config=None):
+        self.stats = StatsClient(prefix="du_miner")
         self.config = copy.deepcopy(config or create_config(NeuronType.MINER))
         check_config(self.config)
 
@@ -425,6 +427,13 @@ class Miner:
             f"Emission:{self.metagraph.E[self.uid]}"
         )
         bt.logging.info(log)
+        try:
+            self.stats.gauge("miner.block", self.metagraph.block.item())
+            self.stats.gauge("miner.stake", float(self.metagraph.S[self.uid]))
+            self.stats.gauge("miner.incentive", float(self.metagraph.I[self.uid]))
+            self.stats.gauge("miner.position", position)
+        except Exception:
+            pass
 
     async def get_index(self, synapse: GetMinerIndex) -> GetMinerIndex:
         """Runs after the GetMinerIndex synapse has been deserialized (i.e. after synapse.data is available)."""
@@ -587,7 +596,7 @@ class Miner:
                 ),
                 labels=labels,
             )
-
+            scrape_cfg.latest_ts_fn = lambda _: None
             # For X source, use the enhanced scraper directly
             if synapse.source == DataSource.X:
                 # Initialize the enhanced scraper directly instead of using the provider
