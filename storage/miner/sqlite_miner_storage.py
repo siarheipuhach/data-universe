@@ -596,3 +596,19 @@ class SqliteMinerStorage(MinerStorage):
 
             # If we reach the end of the cursor then return all of the data entity buckets.
             return data_entity_buckets
+
+    def latest_ts(self, source: DataSource, label: str | None = None) -> dt.datetime | None:
+        """
+        Return the newest timestamp we already have for a given (source, label) pair.
+        • If label is None → look at all labels for that source.
+        • Returns None when no rows yet.
+        """
+        if label is None:
+            sql = "SELECT MAX(datetime) FROM data_entities WHERE source=?"
+            params = (source,)
+        else:
+            sql = "SELECT MAX(datetime) FROM data_entities WHERE source=? AND label=?"
+            params = (source, label)
+
+        row = self.conn.execute(sql, params).fetchone()
+        return datetime.fromisoformat(row[0]) if row and row[0] else None

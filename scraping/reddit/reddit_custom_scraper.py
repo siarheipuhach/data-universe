@@ -1,12 +1,21 @@
+import aiohttp
+import asyncio
+import asyncpraw
+import bittensor as bt
+import datetime as dt
+import os
+import random
 import time
+import traceback
+from dotenv import load_dotenv
+from statsd import StatsClient
+from typing import List
+
 from common import constants, utils
+from common.data import DataEntity, DataLabel, DataSource
 from common.date_range import DateRange
 from scraping.reddit import model
-from scraping.scraper import ScrapeConfig, Scraper, ValidationResult, HFValidationResult
-import bittensor as bt
-from common.data import DataEntity, DataLabel, DataSource
-from typing import List
-import asyncpraw
+from scraping.reddit.model import RedditContent, RedditDataType
 from scraping.reddit.utils import (
     is_valid_reddit_url,
     validate_reddit_content,
@@ -15,17 +24,32 @@ from scraping.reddit.utils import (
     normalize_label,
     normalize_permalink,
 )
-from scraping.reddit.model import RedditContent, RedditDataType
-import traceback
-import datetime as dt
-import asyncio
-import random
-import os
-
-from dotenv import load_dotenv
+from scraping.scraper import ScrapeConfig, Scraper, ValidationResult, HFValidationResult
 
 load_dotenv()
+_stats = StatsClient(prefix="du_miner.reddit")
+_ENTITIES = _stats.incr
 
+
+_PRAW: asyncpraw.Reddit | None = None
+_SESSION: aiohttp.ClientSession | None = None
+
+async def _get_praw() -> asyncpraw.Reddit:
+    global _PRAW, _SESSION
+    if _PRAW is None:
+        if _SESSION is None:
+            connector = aiohttp.TCPConnector(limit=50, keepalive_timeout=30)
+            _SESSION = aiohttp.ClientSession(connector=connector)
+
+        _PRAW = asyncpraw.Reddit(
+            client_id     = os.getenv("REDDIT_CLIENT_ID"),
+            client_secret = os.getenv("REDDIT_CLIENT_SECRET"),
+            username      = os.getenv("REDDIT_USERNAME"),
+            password      = os.getenv("REDDIT_PASSWORD"),
+            user_agent    = f"User-Agent: python: {os.getenv('REDDIT_USERNAME')}",
+            requestor_kwargs={"session": _SESSION},   # hand the pooled session in
+        )
+    return _PRAW
 
 class RedditCustomScraper(Scraper):
     """
@@ -42,6 +66,8 @@ class RedditCustomScraper(Scraper):
         results = []
 
         # For verification, it's easiest to perform each query separately.
+        reddit = await _get_praw()
+
         for entity in entities:
             # First check the URI is a valid Reddit URL.
             if not is_valid_reddit_url(entity.uri):
@@ -55,10 +81,10 @@ class RedditCustomScraper(Scraper):
                 continue
 
             # Parse out the RedditContent object that we're validating
-            reddit_content_to_verify = None
             try:
                 reddit_content_to_verify = RedditContent.from_data_entity(entity)
             except Exception:
+                reddit_content_to_verify = None
                 bt.logging.error(
                     f"Failed to decode RedditContent from data entity bytes: {traceback.format_exc()}."
                 )
@@ -75,23 +101,16 @@ class RedditCustomScraper(Scraper):
             content = None
 
             try:
-                async with asyncpraw.Reddit(
-                    client_id=os.getenv("REDDIT_CLIENT_ID"),
-                    client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-                    username=os.getenv("REDDIT_USERNAME"),
-                    password=os.getenv("REDDIT_PASSWORD"),
-                    user_agent=RedditCustomScraper.USER_AGENT,
-                ) as reddit:
-                    if reddit_content_to_verify.data_type == RedditDataType.POST:
-                        submission = await reddit.submission(
-                            url=reddit_content_to_verify.url
-                        )
-                        # Parse the response.
-                        content = self._best_effort_parse_submission(submission)
-                    else:
-                        comment = await reddit.comment(url=reddit_content_to_verify.url)
-                        # Parse the response.
-                        content = self._best_effort_parse_comment(comment)
+                if reddit_content_to_verify.data_type == RedditDataType.POST:
+                    submission = await reddit.submission(
+                        url=reddit_content_to_verify.url
+                    )
+                    # Parse the response.
+                    content = self._best_effort_parse_submission(submission)
+                else:
+                    comment = await reddit.comment(url=reddit_content_to_verify.url)
+                    # Parse the response.
+                    content = self._best_effort_parse_comment(comment)
             except Exception as e:
                 bt.logging.error(
                     f"Failed to validate entity ({entity.uri})[{entity.content}]: {traceback.format_exc()}."
@@ -126,7 +145,7 @@ class RedditCustomScraper(Scraper):
                     entity_to_validate=entity,
                 )
             )
-
+        _ENTITIES("validate.entities", len(results))
         return results
 
     async def validate_hf(self, entities) -> HFValidationResult:
@@ -143,19 +162,14 @@ class RedditCustomScraper(Scraper):
 
             content = None
             try:
-                async with asyncpraw.Reddit(
-                        client_id=os.getenv("REDDIT_CLIENT_ID"),
-                        client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-                        username=os.getenv("REDDIT_USERNAME"),
-                        password=os.getenv("REDDIT_PASSWORD"),
-                        user_agent=RedditCustomScraper.USER_AGENT,
-                ) as reddit:
-                    if entity.get('dataType') == RedditDataType.COMMENT:
-                        comment = await reddit.comment(url=entity.get('url'))
-                        content = self._best_effort_parse_comment(comment)
-                    else:
-                        submission = await reddit.submission(url=entity.get('url'))
-                        content = self._best_effort_parse_submission(submission)
+                reddit = await _get_praw()
+
+                if entity.get('dataType') == RedditDataType.COMMENT:
+                    comment = await reddit.comment(url=entity.get('url'))
+                    content = self._best_effort_parse_comment(comment)
+                else:
+                    submission = await reddit.submission(url=entity.get('url'))
+                    content = self._best_effort_parse_submission(submission)
             except Exception as e:
                 bt.logging.error(
                     f"Failed to validate entity ({entity.get('url')}): {traceback.format_exc()}."
@@ -207,6 +221,7 @@ class RedditCustomScraper(Scraper):
 
     async def scrape(self, scrape_config: ScrapeConfig) -> List[DataEntity]:
         """Scrapes a batch of reddit posts/comments according to the scrape config."""
+        start_ns = time.perf_counter_ns()
         bt.logging.trace(
             f"Reddit custom scraper peforming scrape with config: {scrape_config}."
         )
@@ -219,6 +234,22 @@ class RedditCustomScraper(Scraper):
         subreddit_name = (
             normalize_label(scrape_config.labels[0]) if scrape_config.labels else "all"
         )
+
+        latest_ts_fn = getattr(scrape_config, "latest_ts_fn", None)
+        if callable(latest_ts_fn):
+            try:
+                latest_known = latest_ts_fn(subreddit_name)   # should return datetime or None
+            except Exception:
+                latest_known = None
+
+            if latest_known and latest_known >= scrape_config.date_range.end:
+                bt.logging.trace(
+                    f"Skip scrape — already have data up to {latest_known} "
+                    f"for {subreddit_name}"
+                )
+                _stats.timing("scrape_ms", (time.perf_counter_ns() - start_ns)//1_000_000)
+                _ENTITIES("scrape.entities", 0)
+                return []
 
         bt.logging.trace(
              f"Running custom Reddit scraper with search: {subreddit_name}."
@@ -235,56 +266,52 @@ class RedditCustomScraper(Scraper):
         # In either case we parse the response into a list of RedditContents.
         contents = None
         try:
-            async with asyncpraw.Reddit(
-                client_id=os.getenv("REDDIT_CLIENT_ID"),
-                client_secret=os.getenv("REDDIT_CLIENT_SECRET"),
-                username=os.getenv("REDDIT_USERNAME"),
-                password=os.getenv("REDDIT_PASSWORD"),
-                user_agent=RedditCustomScraper.USER_AGENT,
-            ) as reddit:
-                subreddit = await reddit.subreddit(subreddit_name)
+            reddit = await _get_praw()
+            subreddit = await reddit.subreddit(subreddit_name)
 
-                if fetch_submissions:
-                    submissions = None
-                    match search_sort:
-                        case "new":
-                            submissions = subreddit.new(limit=search_limit)
-                        case "top":
-                            submissions = subreddit.top(
-                                limit=search_limit, time_filter=search_time
-                            )
-                        case "hot":
-                            submissions = subreddit.hot(limit=search_limit)
+            if fetch_submissions:
+                submissions = None
+                match search_sort:
+                    case "new":
+                        submissions = subreddit.new(limit=search_limit)
+                    case "top":
+                        submissions = subreddit.top(
+                            limit=search_limit, time_filter=search_time
+                        )
+                    case "hot":
+                        submissions = subreddit.hot(limit=search_limit)
 
-                    contents = [
-                        self._best_effort_parse_submission(submission)
-                        async for submission in submissions
-                    ]
-                else:
-                    comments = subreddit.comments(limit=search_limit)
+                contents = [
+                    self._best_effort_parse_submission(submission)
+                    async for submission in submissions
+                ]
+            else:
+                comments = subreddit.comments(limit=search_limit)
 
-                    contents = [
-                        self._best_effort_parse_comment(comment)
-                        async for comment in comments
-                    ]
+                contents = [
+                    self._best_effort_parse_comment(comment)
+                    async for comment in comments
+                ]
         except Exception:
             bt.logging.error(
-                f"Failed to scrape reddit using subreddit {subreddit_name}, limit {search_limit}, time {search_time}, sort {search_sort}: {traceback.format_exc()}."
+                f"Failed to scrape reddit using subreddit {subreddit_name}, limit {search_limit}, "
+                f"time {search_time}, sort {search_sort}: {traceback.format_exc()}."
             )
-            # TODO: Raise a specific exception, in case the scheduler wants to have some logic for retries.
+            _stats.timing("scrape_ms", (time.perf_counter_ns() - start_ns)//1_000_000)
+            _ENTITIES("scrape.entities", 0)
             return []
 
         # Return the parsed results, ignoring data that can't be parsed.
-        parsed_contents = [content for content in contents if content != None]
+        parsed_contents = [c for c in contents if c is not None]
 
         bt.logging.success(
             f"Completed scrape for subreddit {subreddit_name}. Scraped {len(parsed_contents)} items."
         )
 
-        data_entities = []
-        for content in parsed_contents:
-            data_entities.append(RedditContent.to_data_entity(content=content))
+        data_entities = [RedditContent.to_data_entity(content=c) for c in parsed_contents]
 
+        _stats.timing("scrape_ms", (time.perf_counter_ns() - start_ns)//1_000_000)
+        _ENTITIES("scrape.entities", len(data_entities))
         return data_entities
 
     def _best_effort_parse_submission(
